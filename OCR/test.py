@@ -21,15 +21,14 @@ PDF_PATH = os.path.join(
 # ============================================================
 
 def pdf_to_images(pdf_path):
-
     pdf = fitz.open(pdf_path)
-
     images = []
 
     for page in pdf:
-
+        # FIXED: Added alpha=False to prevent RGBA crash when forcing RGB mode
         pix = page.get_pixmap(
-            matrix=fitz.Matrix(3, 3)
+            matrix=fitz.Matrix(3, 3),
+            alpha=False 
         )
 
         img = Image.frombytes(
@@ -37,11 +36,9 @@ def pdf_to_images(pdf_path):
             [pix.width, pix.height],
             pix.samples
         )
-
         images.append(img)
 
     pdf.close()
-
     return images
 
 
@@ -50,7 +47,6 @@ def pdf_to_images(pdf_path):
 # ============================================================
 
 def preprocess_image(image):
-
     img = np.array(image)
 
     gray = cv2.cvtColor(
@@ -90,27 +86,21 @@ def preprocess_image(image):
 # ============================================================
 
 def extract_text(pdf_path):
-
     pages = pdf_to_images(pdf_path)
-
     all_text = []
 
     for image in pages:
-
         processed = preprocess_image(image)
-
         text = pytesseract.image_to_string(
             processed,
             config="--psm 6"
         )
-
         all_text.append(text)
 
     return "\n".join(all_text)
 
 
 if __name__ == "__main__":
-
     text = extract_text(PDF_PATH)
 
     print("\n")

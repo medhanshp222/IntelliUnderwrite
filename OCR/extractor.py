@@ -1,6 +1,8 @@
 import os
 import re
+from collections import defaultdict
 from datetime import datetime
+from statistics import median
 
 import pymupdf
 import pytesseract
@@ -20,7 +22,7 @@ PDF_PATH = os.path.join(
 
 
 # ============================================================
-# 1. CONVERT PDF TO IMAGES
+# 1. PDF -> IMAGES
 # ============================================================
 
 def pdf_to_images(pdf_path):
@@ -36,13 +38,13 @@ def pdf_to_images(pdf_path):
             alpha=False
         )
 
-        img = Image.frombytes(
+        image = Image.frombytes(
             "RGB",
             [pix.width, pix.height],
             pix.samples
         )
 
-        images.append(img)
+        images.append(image)
 
     pdf.close()
 
@@ -50,7 +52,7 @@ def pdf_to_images(pdf_path):
 
 
 # ============================================================
-# 2. PREPROCESS IMAGE
+# 2. IMAGE PREPROCESSING
 # ============================================================
 
 def preprocess_image(image):
@@ -62,7 +64,6 @@ def preprocess_image(image):
         cv2.COLOR_RGB2GRAY
     )
 
-    # Improve OCR resolution
     gray = cv2.resize(
         gray,
         None,
@@ -71,14 +72,12 @@ def preprocess_image(image):
         interpolation=cv2.INTER_CUBIC
     )
 
-    # Remove small noise
     gray = cv2.GaussianBlur(
         gray,
         (3, 3),
         0
     )
 
-    # Threshold
     _, threshold = cv2.threshold(
         gray,
         0,
@@ -95,13 +94,17 @@ def preprocess_image(image):
 
 def extract_text(pdf_path):
 
-    pages = pdf_to_images(pdf_path)
+    pages = pdf_to_images(
+        pdf_path
+    )
 
     all_text = []
 
     for image in pages:
 
-        processed = preprocess_image(image)
+        processed = preprocess_image(
+            image
+        )
 
         text = pytesseract.image_to_string(
             processed,
@@ -114,129 +117,43 @@ def extract_text(pdf_path):
 
 
 # ============================================================
-# 4. AMOUNT CONVERSION
+# REGEX
 # ============================================================
 
-def amount_to_float(value):
+DATE_PATTERN = re.compile(
+    r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b"
+)
 
-    if not value:
-        return 0.0
-
-    value = value.replace(",", "")
-    value = value.replace("₹", "")
-    value = value.replace("$", "")
-    value = value.strip()
-
-    try:
-        return float(value)
-    except ValueError:
-        return 0.0
+AMOUNT_PATTERN = re.compile(
+    r"(?<!\d)\d[\d,]*\.\d{2}(?!\d)"
+)
 
 
 # ============================================================
-# 5. EXTRACT TRANSACTION ROWS
+# DATE PARSER
 # ============================================================
 
-def extract_transactions(text):
+def parse_date(value):
 
-    transactions = []
+    value = value.replace(
+        "-",
+        "/"
+    )
 
-    lines = text.splitlines()
+    value = value.replace(
+        ".",
+        "/"
+    )
 
-    # Normal HDFC date
-    date_pattern = r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b"
-
-    # Money value
-    amount_pattern = r"\b\d[\d,]*\.\d{2}\b"
-
-    for line in lines:
-
-        line = line.strip()
-
-        if not line:
-            continue
-
-        date_match = re.search(
-            date_pattern,
-            line
-        )
-
-        if not date_match:
-            continue
-
-        amounts = re.findall(
-            amount_pattern,
-            line
-        )
-
-        # A transaction normally has amount + balance
-        if len(amounts) < 2:
-            continue
-
-        transaction_date = date_match.group(1)
-
-        # Everything after first date
-        remaining = line[
-            date_match.end():
-        ].strip()
-
-        # OCR statements usually contain:
-        #
-        # narration | transaction date | amount | balance
-        #
-        # Therefore:
-        # second-last amount = transaction amount
-        # last amount        = closing balance
-
-        transaction_amount = amount_to_float(
-            amounts[-2]
-        )
-
-        closing_balance = amount_to_float(
-            amounts[-1]
-        )
-
-        # Remove amounts from narration
-        narration = remaining
-
-        for amount in amounts:
-            narration = narration.replace(
-                amount,
-                " "
-            )
-
-        narration = re.sub(
-            r"\s+",
-            " ",
-            narration
-        ).strip()
-
-        transactions.append({
-            "date": transaction_date,
-            "narration": narration,
-            "amount": transaction_amount,
-            "balance": closing_balance
-        })
-
-    return transactions
-
-
-# ============================================================
-# 6. PARSE DATE
-# ============================================================
-
-def parse_date(date_string):
-
-    formats = [
-        "%d/%m/%y",
-        "%d/%m/%Y"
-    ]
-
-    for fmt in formats:
+    for fmt in (
+        "%d/%m/%Y",
+        "%d/%m/%y"
+    ):
 
         try:
+
             return datetime.strptime(
-                date_string,
+                value,
                 fmt
             )
 
@@ -247,250 +164,512 @@ def parse_date(date_string):
 
 
 # ============================================================
-# 7. FIND SALARY TRANSACTIONS
+# AMOUNT PARSER
 # ============================================================
 
-def find_salary_transactions(transactions):
+def amount_to_float(value):
 
-    salary_transactions = []
-
-    months = (
-        "JAN",
-        "FEB",
-        "MAR",
-        "APR",
-        "MAY",
-        "JUN",
-        "JUL",
-        "AUG",
-        "SEP",
-        "OCT",
-        "NOV",
-        "DEC"
+    value = value.replace(
+        ",",
+        ""
     )
 
-    for transaction in transactions:
+    value = value.replace(
+        "₹",
+        ""
+    )
 
-        narration = transaction[
-            "narration"
-        ].upper()
+    try:
 
-        # ----------------------------------------------------
-        # Only accept actual monthly salary narration
-        #
-        # Examples:
-        # SALARY JUNE 19
-        # SALARY AUG 19
-        # SALARY NOV 19
-        #
-        # Do NOT accept:
-        # EARLYSALARY
-        # RAZORPAY EARLY SALARY
-        # ----------------------------------------------------
+        return float(value)
 
-        salary_pattern = (
-            r"\bSALARY\b.*\b("
-            + "|".join(months)
-            + r")\b"
+    except ValueError:
+
+        return 0.0
+
+
+# ============================================================
+# CLEAN NARRATION
+# ============================================================
+
+def clean_narration(text):
+
+    text = text.upper()
+
+    text = text.replace(
+        "–",
+        "-"
+    )
+
+    text = text.replace(
+        "—",
+        "-"
+    )
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
+
+    return text.strip()
+
+
+# ============================================================
+# 4. EXTRACT TRANSACTION ROWS
+#
+# Expected OCR structure:
+#
+# DATE | NARRATION | DATE | AMOUNT | BALANCE
+#
+# Example:
+#
+# 05/08/19 | ACH D- ADITY BIRLA FINANCE ...
+# | 05/08/19 19,355.00 2,399.05
+#
+# Last amount  -> Balance
+# Previous     -> Transaction amount
+# ============================================================
+
+def extract_transactions(text):
+
+    transactions = []
+
+    for raw_line in text.splitlines():
+
+        line = raw_line.strip()
+
+        if not line:
+            continue
+
+        date_match = DATE_PATTERN.search(
+            line
         )
 
-        if re.search(
-            salary_pattern,
+        if not date_match:
+            continue
+
+        date_string = date_match.group()
+
+        parsed_date = parse_date(
+            date_string
+        )
+
+        if not parsed_date:
+            continue
+
+        amounts = AMOUNT_PATTERN.findall(
+            line
+        )
+
+        # Need transaction amount + balance
+        if len(amounts) < 2:
+            continue
+
+        values = [
+            amount_to_float(x)
+            for x in amounts
+        ]
+
+        # Last numeric value = balance
+        balance = values[-1]
+
+        # Previous numeric value = transaction amount
+        amount = values[-2]
+
+        # Remove dates
+        narration = DATE_PATTERN.sub(
+            " ",
+            line
+        )
+
+        # Remove amounts
+        narration = AMOUNT_PATTERN.sub(
+            " ",
             narration
-        ):
+        )
 
-            salary_transactions.append(
-                transaction
-            )
+        narration = clean_narration(
+            narration
+        )
 
-    return salary_transactions
+        transactions.append({
+
+            "date": parsed_date,
+
+            "date_string": date_string,
+
+            "narration": narration,
+
+            "amount": amount,
+
+            "balance": balance,
+
+            "raw": line
+        })
+
+    return transactions
 
 
 # ============================================================
-# 8. FIND EMI TRANSACTIONS
+# 5. SALARY DETECTION
 # ============================================================
 
-def find_emi_transactions(transactions):
+def is_real_salary(transaction):
 
-    emi_transactions = []
+    narration = transaction[
+        "narration"
+    ]
+
+    # Must contain SALARY
+    if "SALARY" not in narration:
+        return False
+
+    # Do not count EarlySalary / salary advance
+    excluded_words = [
+
+        "EARLYSALARY",
+
+        "EARLY SALARY",
+
+        "RAZPEARLYSALARY",
+
+        "RAZPEARL YSALARY",
+
+        "FLEXSALARY"
+    ]
+
+    for word in excluded_words:
+
+        if word in narration:
+            return False
+
+    # Do not count debit salary-like transactions
+    if "NEFT DR" in narration:
+        return False
+
+    if "DEBIT" in narration:
+        return False
+
+    return True
+
+
+def find_salary_transactions(
+    transactions
+):
+
+    salaries = []
 
     for transaction in transactions:
 
-        narration = transaction[
-            "narration"
-        ].upper()
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # EMI is NOT every transaction containing DEBIT.
-        #
-        # Only the required EMI factors:
-        #
-        # ACH D-
-        # BAJAJ FINEMI
-        # RP-CASHE
-        # LOAN
-        #
-        # ----------------------------------------------------
-
-        is_ach_debit = (
-            "ACH D-" in narration
-            or "ACH DEBIT" in narration
-        )
-
-        is_bajaj = (
-            "BAJAJ FINEMI" in narration
-        )
-
-        is_rp_cashe = (
-            "RP-CASHE" in narration
-            or "RP CASHE" in narration
-        )
-
-        is_loan = (
-            "LOAN" in narration
-            or "LOANTAP" in narration
-        )
-
-        # ----------------------------------------------------
-        # Exclude:
-        #
-        # Salary
-        # Loan credits
-        # Return charges
-        # Bounce charges
-        # ----------------------------------------------------
-
-        is_salary = (
-            "SALARY" in narration
-        )
-
-        is_return_charge = (
-            "RETURN CHARGES" in narration
-            or "DEBIT RETURN" in narration
-            or "ECS RETURN" in narration
-            or "NACH RETURN" in narration
-        )
-
-        # If transaction contains loan but is actually a
-        # credit, don't count it as EMI.
-        #
-        # Example:
-        # IMPS-LOANTAP CREDIT PRODUCT
-        #
-
-        is_loan_credit = (
-            "CREDIT PRODUCT" in narration
-            or "LOAN CREDIT" in narration
-        )
-
-        if is_salary:
-            continue
-
-        if is_return_charge:
-            continue
-
-        if is_loan_credit:
-            continue
-
-        if (
-            is_ach_debit
-            or is_bajaj
-            or is_rp_cashe
-            or is_loan
+        if is_real_salary(
+            transaction
         ):
 
-            emi_transactions.append(
+            salaries.append(
                 transaction
             )
 
-    return emi_transactions
+    return salaries
 
 
 # ============================================================
-# 9. FIND BOUNCE TRANSACTIONS
+# 6. SALARY CREDIT COUNT
+#
+# Count ONE genuine salary credit per month.
 # ============================================================
 
-def find_bounce_transactions(transactions):
+def calculate_salary_credits_count(
+    salaries
+):
 
-    bounce_transactions = []
+    months = set()
 
-    for transaction in transactions:
+    for transaction in salaries:
 
-        narration = transaction[
-            "narration"
-        ].upper()
+        date = transaction[
+            "date"
+        ]
 
-        # ----------------------------------------------------
-        # ONLY the factors specified:
-        #
-        # ACH DEBIT RETURN CHARGES
-        # ECS DEBIT RETURN
-        # OVERDUE
-        #
-        # ----------------------------------------------------
-
-        is_ach_return = (
-            "ACH DEBIT RETURN CHARGES"
-            in narration
-        )
-
-        is_ecs_return = (
-            "ECS DEBIT RETURN"
-            in narration
-        )
-
-        is_overdue = (
-            "OVERDUE"
-            in narration
-        )
-
-        if (
-            is_ach_return
-            or is_ecs_return
-            or is_overdue
-        ):
-
-            bounce_transactions.append(
-                transaction
+        months.add(
+            (
+                date.year,
+                date.month
             )
+        )
 
-    return bounce_transactions
+    return len(months)
 
 
 # ============================================================
-# 10. CALCULATE SALARY DATE VARIANCE
+# 7. SALARY DATE VARIANCE
 # ============================================================
 
 def calculate_salary_date_variance(
-    salary_transactions
+    salaries
 ):
 
-    dates = []
-
-    for transaction in salary_transactions:
-
-        parsed = parse_date(
-            transaction["date"]
-        )
-
-        if parsed:
-
-            dates.append(
-                parsed.day
-            )
-
-    if len(dates) < 2:
+    if not salaries:
         return 0
 
-    # Difference between earliest and latest
-    # salary credit day
-    return max(dates) - min(dates)
+    monthly_salary_days = {}
+
+    for transaction in salaries:
+
+        date = transaction[
+            "date"
+        ]
+
+        month_key = (
+            date.year,
+            date.month
+        )
+
+        # Keep only one salary date per month
+        if month_key not in monthly_salary_days:
+
+            monthly_salary_days[
+                month_key
+            ] = date.day
+
+    days = list(
+        monthly_salary_days.values()
+    )
+
+    if len(days) < 2:
+        return 0
+
+    return (
+        max(days)
+        -
+        min(days)
+    )
 
 
 # ============================================================
-# 11. CALCULATE MONTHLY EMI
+# 8. BOUNCE DETECTION
+#
+# Do NOT count generic RETURN.
+# Only actual negative markers.
+# ============================================================
+
+BOUNCE_KEYWORDS = [
+
+    "ACH DEBIT RETURN CHARGES",
+
+    "ACH D- RETURN CHARG",
+
+    "ECS DEBIT RETURN",
+
+    "ECS RETURN",
+
+    "NACH DEBIT RETURN",
+
+    "NACH RETURN",
+
+    "CHEQUE RETURN",
+
+    "CHQ RETURN",
+
+    "CHQ RTN",
+
+    "BOUNCE CHARGE",
+
+    "BOUNCED CHARGE",
+
+    "NSF CHARGE",
+
+    "PENALTY CHARGE"
+]
+
+
+def is_bounce(transaction):
+
+    narration = transaction[
+        "narration"
+    ]
+
+    return any(
+        keyword in narration
+        for keyword in BOUNCE_KEYWORDS
+    )
+
+
+def find_bounce_transactions(
+    transactions
+):
+
+    result = []
+
+    for transaction in transactions:
+
+        if is_bounce(
+            transaction
+        ):
+
+            result.append(
+                transaction
+            )
+
+    return result
+
+
+# ============================================================
+# 9. EMI / LOAN DETECTION
+#
+# IMPORTANT:
+# "DEBIT" alone is NOT an EMI.
+# ============================================================
+
+EMI_LENDER_KEYWORDS = {
+
+    "BAJAJ": [
+        "BAJAJ FINEMI",
+        "BAJAJ FINEML",
+        "BAJAJ FINANCE"
+    ],
+
+    "CASHE": [
+        "RP-CASHE",
+        "RP CASHE"
+    ],
+
+    "ADITYA_BIRLA": [
+        "ADITY BIRLA FINANCE",
+        "ADITYA BIRLA FINANCE"
+    ],
+
+    "INDIABULLS": [
+        "INDIABULLS",
+        "INDIA BULLS"
+    ],
+
+    "IVL": [
+        "IVL FINANCE"
+    ],
+
+    "VIVIFI": [
+        "VIVIFI INDIA FINANCE"
+    ],
+
+    "LOANTAP": [
+        "LOANTAP",
+        "LOANTP"
+    ],
+
+    "CASHBEAN": [
+        "CASHBEAN"
+    ],
+
+    "EMI": [
+        "EMI"
+    ],
+
+    "LOAN": [
+        "LOAN INTEREST",
+        "LOAN REPAYMENT",
+        "LOAN INSTALLMENT"
+    ]
+}
+
+
+def identify_emi_lender(
+    narration
+):
+
+    narration = narration.upper()
+
+    for lender, keywords in (
+        EMI_LENDER_KEYWORDS.items()
+    ):
+
+        for keyword in keywords:
+
+            if keyword in narration:
+
+                return lender
+
+    # ACH/NACH/ECS are also recurring debit mechanisms
+    if "ACH D-" in narration:
+        return "ACH"
+
+    if "ACH DEBIT" in narration:
+        return "ACH"
+
+    if "NACH" in narration:
+        return "NACH"
+
+    if "ECS" in narration:
+        return "ECS"
+
+    return None
+
+
+def is_emi(transaction):
+
+    narration = transaction[
+        "narration"
+    ]
+
+    # Salary is not EMI
+    if is_real_salary(
+        transaction
+    ):
+        return False
+
+    # Bounce is not EMI
+    if is_bounce(
+        transaction
+    ):
+        return False
+
+    # Credit-side loan transaction is not EMI
+    if "CREDIT PRODUCT" in narration:
+        return False
+
+    if "LOAN CREDIT" in narration:
+        return False
+
+    lender = identify_emi_lender(
+        narration
+    )
+
+    return lender is not None
+
+
+def find_emi_transactions(
+    transactions
+):
+
+    result = []
+
+    for transaction in transactions:
+
+        if not is_emi(
+            transaction
+        ):
+            continue
+
+        if transaction[
+            "amount"
+        ] <= 0:
+            continue
+
+        result.append(
+            transaction
+        )
+
+    return result
+
+
+# ============================================================
+# 10. CALCULATE MONTHLY EMI
+#
+# For every lender:
+#
+#   lender -> monthly payments
+#
+# We find the recurring amount.
 # ============================================================
 
 def calculate_monthly_emi(
@@ -500,146 +679,239 @@ def calculate_monthly_emi(
     if not emi_transactions:
         return 0.0
 
-    monthly_totals = {}
+    lender_month_amounts = defaultdict(
+        lambda: defaultdict(list)
+    )
 
     for transaction in emi_transactions:
 
-        parsed_date = parse_date(
-            transaction["date"]
-        )
-
-        if not parsed_date:
-            continue
-
-        month_key = (
-            parsed_date.year,
-            parsed_date.month
-        )
-
-        amount = transaction[
-            "amount"
+        narration = transaction[
+            "narration"
         ]
 
-        if month_key not in monthly_totals:
-            monthly_totals[month_key] = 0.0
+        lender = identify_emi_lender(
+            narration
+        )
 
-        monthly_totals[
-            month_key
-        ] += amount
+        if lender is None:
+            continue
 
-    if not monthly_totals:
-        return 0.0
+        date = transaction[
+            "date"
+        ]
 
-    # Average EMI obligation per month
-    return (
-        sum(monthly_totals.values())
-        / len(monthly_totals)
+        month_key = (
+            date.year,
+            date.month
+        )
+
+        amount = round(
+            transaction["amount"],
+            2
+        )
+
+        lender_month_amounts[
+            lender
+        ][month_key].append(
+            amount
+        )
+
+    # --------------------------------------------------------
+    # Find recurring monthly amount for each lender.
+    # --------------------------------------------------------
+
+    recurring_emi_values = []
+
+    for lender, month_data in (
+        lender_month_amounts.items()
+    ):
+
+        monthly_values = []
+
+        for month, amounts in (
+            month_data.items()
+        ):
+
+            if not amounts:
+                continue
+
+            # Remove exact duplicate OCR entries
+            unique_values = list(
+                set(amounts)
+            )
+
+            # Median handles a possible OCR anomaly
+            monthly_value = median(
+                unique_values
+            )
+
+            monthly_values.append(
+                monthly_value
+            )
+
+        # A recurring EMI should be visible in at least
+        # two months.
+        if len(monthly_values) >= 2:
+
+            lender_emi = median(
+                monthly_values
+            )
+
+            recurring_emi_values.append(
+                lender_emi
+            )
+
+    return round(
+        sum(recurring_emi_values),
+        2
     )
 
 
 # ============================================================
-# 12. CALCULATE AVERAGE MONTHLY BALANCE
+# 11. DAILY CLOSING BALANCES
+# ============================================================
+
+def get_daily_closing_balances(
+    transactions
+):
+
+    ordered = sorted(
+        transactions,
+        key=lambda x: x["date"]
+    )
+
+    daily_balances = {}
+
+    for transaction in ordered:
+
+        date = transaction[
+            "date"
+        ].date()
+
+        balance = transaction[
+            "balance"
+        ]
+
+        daily_balances[
+            date
+        ] = balance
+
+    return daily_balances
+
+
+# ============================================================
+# 12. AVERAGE MONTHLY BALANCE
+#
+# Your factor:
+#
+# "Mean of daily closing balance entries"
+#
+# Therefore:
+#
+# 1. Take LAST balance for each day.
+# 2. Group those balances by month.
+# 3. Calculate the monthly average.
+# 4. Average the monthly averages.
+#
+# We DO NOT carry balances into days having no transaction.
 # ============================================================
 
 def calculate_average_monthly_balance(
     transactions
 ):
 
-    monthly_balances = {}
-
-    for transaction in transactions:
-
-        parsed_date = parse_date(
-            transaction["date"]
+    daily_balances = (
+        get_daily_closing_balances(
+            transactions
         )
+    )
 
-        if not parsed_date:
-            continue
+    if not daily_balances:
+        return 0.0
+
+    monthly_balances = defaultdict(
+        list
+    )
+
+    for date, balance in (
+        daily_balances.items()
+    ):
 
         month_key = (
-            parsed_date.year,
-            parsed_date.month
-        )
-
-        balance = transaction[
-            "balance"
-        ]
-
-        monthly_balances.setdefault(
-            month_key,
-            []
+            date.year,
+            date.month
         )
 
         monthly_balances[
             month_key
-        ].append(balance)
-
-    if not monthly_balances:
-        return 0.0
-
-    # --------------------------------------------------------
-    # First calculate average daily/transaction balance
-    # for each month.
-    # --------------------------------------------------------
+        ].append(
+            balance
+        )
 
     monthly_averages = []
 
-    for balances in monthly_balances.values():
+    for balances in (
+        monthly_balances.values()
+    ):
 
-        if balances:
+        if not balances:
+            continue
 
-            monthly_average = (
-                sum(balances)
-                / len(balances)
-            )
+        monthly_average = (
+            sum(balances)
+            /
+            len(balances)
+        )
 
-            monthly_averages.append(
-                monthly_average
-            )
+        monthly_averages.append(
+            monthly_average
+        )
 
     if not monthly_averages:
         return 0.0
 
-    # Average of monthly averages
-    return (
+    return round(
         sum(monthly_averages)
-        / len(monthly_averages)
+        /
+        len(monthly_averages),
+        2
     )
 
 
 # ============================================================
-# 13. EXTRACT REQUIRED METRICS
+# 13. EXTRACT FIVE REQUIRED METRICS
 # ============================================================
 
 def extract_bank_statement_metrics(
     text
 ):
 
-    # --------------------------------------------------------
     # Extract transactions
-    # --------------------------------------------------------
-
-    transactions = extract_transactions(
-        text
+    transactions = (
+        extract_transactions(
+            text
+        )
     )
 
     # --------------------------------------------------------
-    # Salary
+    # SALARY
     # --------------------------------------------------------
 
-    salary_transactions = (
+    salaries = (
         find_salary_transactions(
             transactions
         )
     )
 
-    salary_credits_count = len(
-        salary_transactions
+    salary_count = (
+        calculate_salary_credits_count(
+            salaries
+        )
     )
 
-    salary_date_variance_days = (
+    salary_variance = (
         calculate_salary_date_variance(
-            salary_transactions
+            salaries
         )
     )
 
@@ -647,64 +919,55 @@ def extract_bank_statement_metrics(
     # EMI
     # --------------------------------------------------------
 
-    emi_transactions = (
+    emis = (
         find_emi_transactions(
             transactions
         )
     )
 
-    total_monthly_emis = (
+    monthly_emi = (
         calculate_monthly_emi(
-            emi_transactions
+            emis
         )
     )
 
     # --------------------------------------------------------
-    # Average monthly balance
+    # BALANCE
     # --------------------------------------------------------
 
-    average_monthly_balance = (
+    average_balance = (
         calculate_average_monthly_balance(
             transactions
         )
     )
 
     # --------------------------------------------------------
-    # Bounce
+    # BOUNCES
     # --------------------------------------------------------
 
-    bounce_transactions = (
+    bounces = (
         find_bounce_transactions(
             transactions
         )
     )
 
     bounce_count = len(
-        bounce_transactions
+        bounces
     )
 
-    # --------------------------------------------------------
-    # RETURN ONLY REQUIRED VALUES
-    # --------------------------------------------------------
-
     return {
+
         "salary_credits_count":
-            salary_credits_count,
+            salary_count,
 
         "salary_date_variance_days":
-            salary_date_variance_days,
+            salary_variance,
 
         "total_monthly_emis":
-            round(
-                total_monthly_emis,
-                2
-            ),
+            monthly_emi,
 
         "average_monthly_balance":
-            round(
-                average_monthly_balance,
-                2
-            ),
+            average_balance,
 
         "bounce_count_6_months":
             bounce_count
@@ -712,37 +975,26 @@ def extract_bank_statement_metrics(
 
 
 # ============================================================
-# 14. MAIN
+# 14. FINAL OUTPUT
 # ============================================================
 
-if __name__ == "__main__":
-
-    # --------------------------------------------------------
-    # OCR
-    # --------------------------------------------------------
-
-    text = extract_text(
-        PDF_PATH
-    )
-
-    # --------------------------------------------------------
-    # Extract metrics
-    # --------------------------------------------------------
-
-    metrics = (
-        extract_bank_statement_metrics(
-            text
-        )
-    )
-
-    # --------------------------------------------------------
-    # CLEAN OUTPUT ONLY
-    # --------------------------------------------------------
+def print_metrics(
+    metrics
+):
 
     print()
-    print("=" * 60)
-    print("BANK STATEMENT METRICS")
-    print("=" * 60)
+
+    print(
+        "=" * 60
+    )
+
+    print(
+        "BANK STATEMENT METRICS"
+    )
+
+    print(
+        "=" * 60
+    )
 
     print(
         f"Salary Credits Count       : "
@@ -769,4 +1021,46 @@ if __name__ == "__main__":
         f"{metrics['bounce_count_6_months']}"
     )
 
-    print("=" * 60)
+    print(
+        "=" * 60
+    )
+
+    print()
+
+
+# ============================================================
+# 15. MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    if not os.path.exists(
+        PDF_PATH
+    ):
+
+        print(
+            "ERROR: PDF not found:"
+        )
+
+        print(
+            PDF_PATH
+        )
+
+        raise SystemExit(1)
+
+    # Run OCR
+    text = extract_text(
+        PDF_PATH
+    )
+
+    # Extract required metrics
+    metrics = (
+        extract_bank_statement_metrics(
+            text
+        )
+    )
+
+    # Print only the five factors
+    print_metrics(
+        metrics
+    )
